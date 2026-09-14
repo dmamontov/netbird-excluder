@@ -40,6 +40,8 @@ func main() {
 		removeCmd(os.Args[2:])
 	case "list", "ls":
 		listCmd(os.Args[2:])
+	case "check":
+		checkCmd(os.Args[2:])
 	case "up":
 		setEnabledCmd(true)
 	case "down":
@@ -211,21 +213,37 @@ func listCmd(args []string) {
 	}
 
 	for _, domain := range cfg.Domains {
-		ips, err := resolver.Lookup(domain)
-		if err != nil {
-			fmt.Printf("  %s: resolve error: %v\n", domain, err)
-			continue
-		}
-		for _, ip := range ips {
-			gw, iface, err := routing.RouteInfo(ip)
-			switch {
-			case err != nil:
-				fmt.Printf("  %-30s %-16s route unknown: %v\n", domain, ip, err)
-			case gw == "":
-				fmt.Printf("  %-30s %-16s via %s\n", domain, ip, iface)
-			default:
-				fmt.Printf("  %-30s %-16s via %s (%s)\n", domain, ip, iface, gw)
-			}
+		printDomainRoute(domain)
+	}
+}
+
+// checkCmd prints the same per-domain route line as "list", for domains not
+// (necessarily) in the config - useful to preview what adding one would
+// affect before running "add".
+func checkCmd(args []string) {
+	if len(args) == 0 {
+		log.Fatal("usage: netbird-excluder check <domain> [domain...]")
+	}
+	for _, domain := range args {
+		printDomainRoute(domain)
+	}
+}
+
+func printDomainRoute(domain string) {
+	ips, err := resolver.Lookup(domain)
+	if err != nil {
+		fmt.Printf("  %s: resolve error: %v\n", domain, err)
+		return
+	}
+	for _, ip := range ips {
+		gw, iface, err := routing.RouteInfo(ip)
+		switch {
+		case err != nil:
+			fmt.Printf("  %-30s %-16s route unknown: %v\n", domain, ip, err)
+		case gw == "":
+			fmt.Printf("  %-30s %-16s via %s\n", domain, ip, iface)
+		default:
+			fmt.Printf("  %-30s %-16s via %s (%s)\n", domain, ip, iface, gw)
 		}
 	}
 }

@@ -95,6 +95,14 @@ sudo ./netbird-excluder remove example.com     # alias: rm
 and for each domain its current resolved IP(s) and which interface/gateway
 they're actually routed through right now.
 
+To preview a domain before adding it - no root needed, doesn't touch the
+config or any route:
+
+```bash
+./netbird-excluder check some-site.com
+#   some-site.com                  8.6.112.0        via utun100
+```
+
 ### Pause / resume enforcement
 
 ```bash
