@@ -32,8 +32,8 @@ reconciliation (or a Wi-Fi network change) can't quietly undo it.
   When a domain stops resolving to that IP, or the tool stops/panics/is
   disabled, the original route is restored - not just deleted.
 - The LAN gateway/interface is re-detected from the default route on every
-  pass (unless pinned with `-iface`/`-gateway`), so switching Wi-Fi networks
-  is handled automatically.
+  pass (unless pinned with `--iface`/`--gateway`), so switching Wi-Fi
+  networks is handled automatically.
 - NetBird's own connection status (`netbird status -C ready`) is checked
   every pass. While NetBird is disconnected there's nothing to override, so
   all overrides are restored and enforcement pauses until it reconnects.
@@ -53,7 +53,7 @@ moment - leaving the tunnel.
   (`run`, `install`, `uninstall`, `add`, `remove`, `up`, `down`). `list` does
   not need root.
 - The `netbird` CLI reachable at `/usr/local/bin/netbird`,
-  `/opt/homebrew/bin/netbird`, or on `PATH` (override with `-netbird-bin`).
+  `/opt/homebrew/bin/netbird`, or on `PATH` (override with `--netbird-bin`).
 
 ## Install
 
@@ -92,15 +92,17 @@ sudo ./netbird-excluder remove example.com     # alias: rm
 ```
 
 `list` shows whether enforcement is enabled, whether NetBird is connected,
-and for each domain its current resolved IP(s) and which interface/gateway
-they're actually routed through right now.
+and for each domain its current resolved IP(s) and whether it's actually
+going through NetBird or direct right now (NetBird's interface is found by
+asking it for its own overlay IP and matching it against the local
+interfaces, not by guessing from an interface name).
 
 To preview a domain before adding it - no root needed, doesn't touch the
 config or any route:
 
 ```bash
 ./netbird-excluder check some-site.com
-#   some-site.com                  8.6.112.0        via utun100
+#   some-site.com                  8.6.112.0        via NetBird (utun100)
 ```
 
 ### Pause / resume enforcement
@@ -116,12 +118,12 @@ touch NetBird itself (see `netbird down`/`netbird up` for that).
 ### Run in the foreground
 
 ```bash
-sudo ./netbird-excluder run -interval 30s
+sudo ./netbird-excluder run --interval 30s
 ```
 
-Flags (all optional): `-interval` (default `30s`), `-iface`/`-gateway` (pin
-the LAN gateway instead of auto-detecting it from the default route),
-`-netbird-bin` (path to the `netbird` CLI).
+Flags (all optional): `--interval` (default `30s`), `--iface`/`--gateway`
+(pin the LAN gateway instead of auto-detecting it from the default route),
+`--netbird-bin` (path to the `netbird` CLI).
 
 Stop with Ctrl+C - it restores every route it overrode before exiting. The
 same restore runs if the process panics; it cannot run on `kill -9` or a
@@ -131,15 +133,15 @@ this tool.
 ### Install as a persistent service
 
 ```bash
-sudo ./netbird-excluder install -interval 30s
+sudo ./netbird-excluder install --interval 30s
 ```
 
 Installs the binary to `/usr/local/bin/netbird-excluder`, writes a
 LaunchDaemon plist to `/Library/LaunchDaemons/local.netbird-excluder.plist`
 (`RunAtLoad` + `KeepAlive`), and loads it. Logs go to
-`/var/log/local.netbird-excluder.log`. Accepts the same `-interval` /
-`-iface` / `-gateway` / `-netbird-bin` flags as `run`, plus `-label` and
-`-bin-path` to change the defaults. Manage the domain list with
+`/var/log/local.netbird-excluder.log`. Accepts the same `--interval` /
+`--iface` / `--gateway` / `--netbird-bin` flags as `run`, plus `--label` and
+`--bin-path` to change the defaults. Manage the domain list with
 `add`/`remove`/`list` as usual - the installed daemon reads the same config
 file.
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -9,6 +8,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/spf13/cobra"
 
 	"netbird-excluder/internal/config"
 	"netbird-excluder/internal/enforcer"
@@ -21,42 +22,32 @@ import (
 const defaultLabel = "local.netbird-excluder"
 const defaultBinPath = "/usr/local/bin/netbird-excluder"
 
+// netbirdBin is a persistent flag shared by every subcommand that talks to
+// the netbird CLI (run, install, list, check).
+var netbirdBin string
+
 func main() {
-	if len(os.Args) < 2 {
-		runCmd(nil)
-		return
+	root := &cobra.Command{
+		Use:   "netbird-excluder",
+		Short: "Force specific domains to route via the LAN gateway instead of through NetBird",
 	}
+	root.PersistentFlags().StringVar(&netbirdBin, "netbird-bin", "", "path to the netbird CLI (default: auto-detect)")
 
-	switch os.Args[1] {
-	case "run":
-		runCmd(os.Args[2:])
-	case "install":
-		installCmd(os.Args[2:])
-	case "uninstall":
-		uninstallCmd(os.Args[2:])
-	case "add":
-		addCmd(os.Args[2:])
-	case "remove", "rm":
-		removeCmd(os.Args[2:])
-	case "list", "ls":
-		listCmd(os.Args[2:])
-	case "check":
-		checkCmd(os.Args[2:])
-	case "up":
-		setEnabledCmd(true)
-	case "down":
-		setEnabledCmd(false)
-	default:
-		runCmd(os.Args[1:])
+	root.AddCommand(
+		newRunCmd(),
+		newInstallCmd(),
+		newUninstallCmd(),
+		newAddCmd(),
+		newRemoveCmd(),
+		newListCmd(),
+		newCheckCmd(),
+		newUpCmd(),
+		newDownCmd(),
+	)
+
+	if err := root.Execute(); err != nil {
+		os.Exit(1)
 	}
-}
-
-func runFlags(fs *flag.FlagSet) (*time.Duration, *string, *string, *string) {
-	interval := fs.Duration("interval", 30*time.Second, "how often to re-read the domain list and re-check routes")
-	iface := fs.String("iface", "", "LAN interface to use (default: auto-detect from the default route)")
-	gateway := fs.String("gateway", "", "LAN gateway IP to use (default: auto-detect from the default route)")
-	netbirdBin := fs.String("netbird-bin", "", "path to the netbird CLI, used to check connection status (default: auto-detect)")
-	return interval, iface, gateway, netbirdBin
 }
 
 func requireRoot(action string) {
@@ -65,171 +56,224 @@ func requireRoot(action string) {
 	}
 }
 
-func runCmd(args []string) {
-	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	interval, iface, gateway, netbirdBin := runFlags(fs)
-	fs.Parse(args)
+func newRunCmd() *cobra.Command {
+	var interval time.Duration
+	var iface, gateway string
 
-	requireRoot("(routes modify the kernel routing table)")
+	cmd := &cobra.Command{
+		Use:   "run",
+		Short: "Run in the foreground, enforcing the configured domain list",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			requireRoot("(routes modify the kernel routing table)")
 
-	log.Printf("watching %s, interval=%s", config.Path, *interval)
+			log.Printf("watching %s, interval=%s", config.Path, interval)
 
-	e := enforcer.New(*iface, *gateway, *netbirdBin)
+			e := enforcer.New(iface, gateway, netbirdBin)
 
-	// Any abnormal exit from here on (panic) must still restore the routes
-	// we've overridden, not just leave them pointed at the LAN.
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("panic: %v, restoring routes before exiting", r)
-			e.Close()
-			panic(r)
-		}
-	}()
+			// Any abnormal exit from here on (panic) must still restore the
+			// routes we've overridden, not just leave them pointed at the LAN.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic: %v, restoring routes before exiting", r)
+					e.Close()
+					panic(r)
+				}
+			}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	ticker := time.NewTicker(*interval)
-	defer ticker.Stop()
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
 
-	e.Reconcile()
-	for {
-		select {
-		case <-ticker.C:
 			e.Reconcile()
-		case sig := <-sigCh:
-			log.Printf("received %s, restoring routes and exiting", sig)
-			e.Close()
-			return
-		}
+			for {
+				select {
+				case <-ticker.C:
+					e.Reconcile()
+				case sig := <-sigCh:
+					log.Printf("received %s, restoring routes and exiting", sig)
+					e.Close()
+					return nil
+				}
+			}
+		},
+	}
+
+	cmd.Flags().DurationVar(&interval, "interval", 30*time.Second, "how often to re-read the domain list and re-check routes")
+	cmd.Flags().StringVar(&iface, "iface", "", "LAN interface to use (default: auto-detect from the default route)")
+	cmd.Flags().StringVar(&gateway, "gateway", "", "LAN gateway IP to use (default: auto-detect from the default route)")
+	return cmd
+}
+
+func newInstallCmd() *cobra.Command {
+	var interval time.Duration
+	var iface, gateway, label, binPath string
+
+	cmd := &cobra.Command{
+		Use:   "install",
+		Short: "Install and start a persistent LaunchDaemon",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			requireRoot("to install a LaunchDaemon")
+
+			runArgs := []string{"run", "--interval", interval.String()}
+			if iface != "" {
+				runArgs = append(runArgs, "--iface", iface)
+			}
+			if gateway != "" {
+				runArgs = append(runArgs, "--gateway", gateway)
+			}
+			if netbirdBin != "" {
+				runArgs = append(runArgs, "--netbird-bin", netbirdBin)
+			}
+
+			if err := service.Install(label, binPath, runArgs); err != nil {
+				return fmt.Errorf("install: %w", err)
+			}
+			fmt.Printf("installed and started %s (binary: %s, log: /var/log/%s.log)\n", label, binPath, label)
+			fmt.Println("manage the domain list with: netbird-excluder add|remove|list <domain>")
+			return nil
+		},
+	}
+
+	cmd.Flags().DurationVar(&interval, "interval", 30*time.Second, "how often to re-read the domain list and re-check routes")
+	cmd.Flags().StringVar(&iface, "iface", "", "LAN interface to use (default: auto-detect from the default route)")
+	cmd.Flags().StringVar(&gateway, "gateway", "", "LAN gateway IP to use (default: auto-detect from the default route)")
+	cmd.Flags().StringVar(&label, "label", defaultLabel, "LaunchDaemon label")
+	cmd.Flags().StringVar(&binPath, "bin-path", defaultBinPath, "path to install the binary to")
+	return cmd
+}
+
+func newUninstallCmd() *cobra.Command {
+	var label string
+
+	cmd := &cobra.Command{
+		Use:   "uninstall",
+		Short: "Stop and remove the LaunchDaemon",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			requireRoot("to uninstall a LaunchDaemon")
+			if err := service.Uninstall(label); err != nil {
+				return fmt.Errorf("uninstall: %w", err)
+			}
+			fmt.Printf("uninstalled %s\n", label)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&label, "label", defaultLabel, "LaunchDaemon label")
+	return cmd
+}
+
+func newAddCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "add <domain> [domain...]",
+		Short: "Add domain(s) to the blacklist",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			requireRoot("to change the domain list")
+
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			added := cfg.Add(args)
+			if err := config.Save(cfg); err != nil {
+				return fmt.Errorf("save config: %w", err)
+			}
+
+			if len(added) == 0 {
+				fmt.Println("nothing to add (already present)")
+				return nil
+			}
+			fmt.Printf("added: %s\n", strings.Join(added, ", "))
+			return nil
+		},
 	}
 }
 
-func installCmd(args []string) {
-	fs := flag.NewFlagSet("install", flag.ExitOnError)
-	interval, iface, gateway, netbirdBin := runFlags(fs)
-	label := fs.String("label", defaultLabel, "LaunchDaemon label")
-	binPath := fs.String("bin-path", defaultBinPath, "path to install the binary to")
-	fs.Parse(args)
+func newRemoveCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "remove <domain> [domain...]",
+		Aliases: []string{"rm"},
+		Short:   "Remove domain(s) from the blacklist",
+		Args:    cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			requireRoot("to change the domain list")
 
-	requireRoot("to install a LaunchDaemon")
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			removed := cfg.Remove(args)
+			if err := config.Save(cfg); err != nil {
+				return fmt.Errorf("save config: %w", err)
+			}
 
-	runArgs := []string{"run", "-interval", interval.String()}
-	if *iface != "" {
-		runArgs = append(runArgs, "-iface", *iface)
-	}
-	if *gateway != "" {
-		runArgs = append(runArgs, "-gateway", *gateway)
-	}
-	if *netbirdBin != "" {
-		runArgs = append(runArgs, "-netbird-bin", *netbirdBin)
-	}
-
-	if err := service.Install(*label, *binPath, runArgs); err != nil {
-		log.Fatalf("install: %v", err)
-	}
-	fmt.Printf("installed and started %s (binary: %s, log: /var/log/%s.log)\n", *label, *binPath, *label)
-	fmt.Printf("manage the domain list with: %s add|remove|list <domain>\n", os.Args[0])
-}
-
-func uninstallCmd(args []string) {
-	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
-	label := fs.String("label", defaultLabel, "LaunchDaemon label")
-	fs.Parse(args)
-
-	requireRoot("to uninstall a LaunchDaemon")
-	if err := service.Uninstall(*label); err != nil {
-		log.Fatalf("uninstall: %v", err)
-	}
-	fmt.Printf("uninstalled %s\n", *label)
-}
-
-func addCmd(args []string) {
-	if len(args) == 0 {
-		log.Fatal("usage: netbird-excluder add <domain> [domain...]")
-	}
-	requireRoot("to change the domain list")
-
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
-	added := cfg.Add(args)
-	if err := config.Save(cfg); err != nil {
-		log.Fatalf("save config: %v", err)
-	}
-
-	if len(added) == 0 {
-		fmt.Println("nothing to add (already present)")
-		return
-	}
-	fmt.Printf("added: %s\n", strings.Join(added, ", "))
-}
-
-func removeCmd(args []string) {
-	if len(args) == 0 {
-		log.Fatal("usage: netbird-excluder remove <domain> [domain...]")
-	}
-	requireRoot("to change the domain list")
-
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
-	removed := cfg.Remove(args)
-	if err := config.Save(cfg); err != nil {
-		log.Fatalf("save config: %v", err)
-	}
-
-	if len(removed) == 0 {
-		fmt.Println("nothing to remove (not present)")
-		return
-	}
-	fmt.Printf("removed: %s\n", strings.Join(removed, ", "))
-}
-
-func listCmd(args []string) {
-	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	fs.Parse(args)
-
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
-
-	state := "enabled"
-	if !cfg.Enabled {
-		state = "disabled (netbird-excluder down)"
-	}
-	nbState := "connected"
-	if !netbird.Connected("") {
-		nbState = "not connected"
-	}
-	fmt.Printf("state: %s, netbird: %s\n", state, nbState)
-
-	if len(cfg.Domains) == 0 {
-		fmt.Println("no domains configured")
-		return
-	}
-
-	for _, domain := range cfg.Domains {
-		printDomainRoute(domain)
+			if len(removed) == 0 {
+				fmt.Println("nothing to remove (not present)")
+				return nil
+			}
+			fmt.Printf("removed: %s\n", strings.Join(removed, ", "))
+			return nil
+		},
 	}
 }
 
-// checkCmd prints the same per-domain route line as "list", for domains not
-// (necessarily) in the config - useful to preview what adding one would
-// affect before running "add".
-func checkCmd(args []string) {
-	if len(args) == 0 {
-		log.Fatal("usage: netbird-excluder check <domain> [domain...]")
-	}
-	for _, domain := range args {
-		printDomainRoute(domain)
+func newListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "Show the domain list, enabled state, and each domain's current route",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+
+			state := "enabled"
+			if !cfg.Enabled {
+				state = "disabled (netbird-excluder down)"
+			}
+			nbState := "connected"
+			if !netbird.Connected(netbirdBin) {
+				nbState = "not connected"
+			}
+			fmt.Printf("state: %s, netbird: %s\n", state, nbState)
+
+			if len(cfg.Domains) == 0 {
+				fmt.Println("no domains configured")
+				return nil
+			}
+
+			nbIface, nbErr := netbird.InterfaceName(netbirdBin)
+			for _, domain := range cfg.Domains {
+				printDomainRoute(domain, nbIface, nbErr == nil)
+			}
+			return nil
+		},
 	}
 }
 
-func printDomainRoute(domain string) {
+func newCheckCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "check <domain> [domain...]",
+		Short: "Preview a domain's current route without adding it",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			nbIface, nbErr := netbird.InterfaceName(netbirdBin)
+			for _, domain := range args {
+				printDomainRoute(domain, nbIface, nbErr == nil)
+			}
+			return nil
+		},
+	}
+}
+
+// printDomainRoute prints one line per resolved IP for domain, saying
+// whether it's currently going through NetBird's interface (nbIface, valid
+// only if nbOK) or directly.
+func printDomainRoute(domain, nbIface string, nbOK bool) {
 	ips, err := resolver.Lookup(domain)
 	if err != nil {
 		fmt.Printf("  %s: resolve error: %v\n", domain, err)
@@ -240,24 +284,48 @@ func printDomainRoute(domain string) {
 		switch {
 		case err != nil:
 			fmt.Printf("  %-30s %-16s route unknown: %v\n", domain, ip, err)
+		case nbOK && iface == nbIface:
+			fmt.Printf("  %-30s %-16s via NetBird (%s)\n", domain, ip, iface)
 		case gw == "":
-			fmt.Printf("  %-30s %-16s via %s\n", domain, ip, iface)
+			fmt.Printf("  %-30s %-16s direct via %s\n", domain, ip, iface)
 		default:
-			fmt.Printf("  %-30s %-16s via %s (%s)\n", domain, ip, iface, gw)
+			fmt.Printf("  %-30s %-16s direct via %s (%s)\n", domain, ip, iface, gw)
 		}
 	}
 }
 
-func setEnabledCmd(enabled bool) {
+func newUpCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "up",
+		Short: "Resume enforcement (undo 'down')",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return setEnabled(true)
+		},
+	}
+}
+
+func newDownCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "down",
+		Short: "Restore all overrides and pause enforcement",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return setEnabled(false)
+		},
+	}
+}
+
+func setEnabled(enabled bool) error {
 	requireRoot("to change enabled state")
 
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		return fmt.Errorf("load config: %w", err)
 	}
 	cfg.Enabled = enabled
 	if err := config.Save(cfg); err != nil {
-		log.Fatalf("save config: %v", err)
+		return fmt.Errorf("save config: %w", err)
 	}
 
 	if enabled {
@@ -265,4 +333,5 @@ func setEnabledCmd(enabled bool) {
 	} else {
 		fmt.Println("disabled - a running daemon will restore its overrides and pause on its next check")
 	}
+	return nil
 }
