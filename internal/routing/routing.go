@@ -15,11 +15,12 @@ func DefaultGateway() (gateway string, iface string, err error) {
 }
 
 // RouteInfo reports the gateway and interface the kernel currently uses to
-// reach ip.
-func RouteInfo(ip string) (gateway, iface string, err error) {
-	out, err := exec.Command("route", "-n", "get", "-host", ip).CombinedOutput()
+// reach dest, a single IPv4 address or an IPv4 CIDR range. For a range with
+// no route of its own this is the closest covering route (e.g. default).
+func RouteInfo(dest string) (gateway, iface string, err error) {
+	out, err := routeCmd("get", dest)
 	if err != nil {
-		return "", "", fmt.Errorf("route get %s: %w: %s", ip, err, out)
+		return "", "", err
 	}
 	return parseGatewayAndInterface(string(out))
 }
@@ -40,29 +41,40 @@ func parseGatewayAndInterface(routeGetOutput string) (gateway, iface string, err
 	return gateway, iface, nil
 }
 
-func AddHostRoute(ip, gateway string) error {
-	out, err := exec.Command("route", "-n", "add", "-host", ip, gateway).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("route add -host %s %s: %w: %s", ip, gateway, err, out)
-	}
-	return nil
+// AddRoute installs a route for dest (a host route for an address, a network
+// route for a CIDR range) via gateway.
+func AddRoute(dest, gateway string) error {
+	_, err := routeCmd("add", dest, gateway)
+	return err
 }
 
-// AddInterfaceRoute installs a /32 host route for ip bound directly to an
-// interface (no gateway), matching how NetBird installs its own routes onto
-// its point-to-point utun interface.
-func AddInterfaceRoute(ip, iface string) error {
-	out, err := exec.Command("route", "-n", "add", "-host", ip, "-interface", iface).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("route add -host %s -interface %s: %w: %s", ip, iface, err, out)
-	}
-	return nil
+// AddInterfaceRoute installs a route for dest bound directly to an interface
+// (no gateway), matching how NetBird installs its own routes onto its
+// point-to-point utun interface.
+func AddInterfaceRoute(dest, iface string) error {
+	_, err := routeCmd("add", dest, "-interface", iface)
+	return err
 }
 
-func DeleteHostRoute(ip string) error {
-	out, err := exec.Command("route", "-n", "delete", "-host", ip).CombinedOutput()
+func DeleteRoute(dest string) error {
+	out, err := routeCmd("delete", dest)
 	if err != nil && !strings.Contains(string(out), "not in table") {
-		return fmt.Errorf("route delete -host %s: %w: %s", ip, err, out)
+		return err
 	}
 	return nil
+}
+
+// routeCmd runs "route -n <action>" for dest, selecting it with -net for a
+// CIDR range and -host for a single address.
+func routeCmd(action, dest string, extra ...string) ([]byte, error) {
+	kind := "-host"
+	if strings.Contains(dest, "/") {
+		kind = "-net"
+	}
+	args := append([]string{"-n", action, kind, dest}, extra...)
+	out, err := exec.Command("route", args...).CombinedOutput()
+	if err != nil {
+		return out, fmt.Errorf("route %s: %w: %s", strings.Join(args[1:], " "), err, out)
+	}
+	return out, nil
 }

@@ -1,5 +1,5 @@
-// Package config persists the exclusion list (domains and literal IPv4
-// addresses) and the enabled/disabled state as a hand-editable YAML file, so
+// Package config persists the exclusion list (domains, literal IPv4
+// addresses and IPv4 CIDR ranges) and the enabled/disabled state as a hand-editable YAML file, so
 // it can be managed either by editing the file or via CLI commands, and
 // picked up live by an already-running daemon.
 package config
@@ -37,14 +37,16 @@ exclude:
   # Re-resolved on every pass; every IPv4 address they currently resolve to
   # is routed via the LAN gateway instead of through NetBird.
   domains: []
-  # Literal IPv4 addresses to route via the LAN gateway instead of NetBird.
+  # IPv4 addresses or CIDR ranges (e.g. 10.0.0.0/8) to route via the LAN
+  # gateway instead of NetBird.
   ips: []
 `
 
 type Config struct {
 	Enabled bool
 	Domains []string
-	IPs     []string
+	// IPs holds single IPv4 addresses and IPv4 CIDR ranges.
+	IPs []string
 
 	// doc is the parsed YAML document, kept so Save only touches the values
 	// that changed and leaves the user's comments and layout alone.
@@ -252,7 +254,7 @@ func writeAtomic(path string, data []byte) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-// Add adds any of entries (domains or IPv4 addresses, told apart
+// Add adds any of entries (domains, IPv4 addresses or CIDR ranges, told apart
 // automatically) not already present, returning the normalized ones added.
 // If any entry is invalid nothing is added.
 func (c *Config) Add(entries []string) ([]string, error) {
@@ -284,7 +286,7 @@ func (c *Config) add(entry string) (string, error) {
 	return norm, nil
 }
 
-// Remove drops any of entries (domains or IPv4 addresses) that are present,
+// Remove drops any of entries (domains, IPv4 addresses or CIDR ranges) that are present,
 // returning the normalized ones removed. If any entry is invalid nothing is
 // removed.
 func (c *Config) Remove(entries []string) ([]string, error) {
@@ -403,9 +405,9 @@ const (
 	KindIP
 )
 
-// Classify decides whether entry is an IPv4 address or a domain and returns
-// it normalized. IPv6 addresses and CIDR ranges are rejected explicitly
-// rather than being mistaken for (invalid) domains.
+// Classify decides whether entry is an IPv4 address/CIDR range or a domain
+// and returns it normalized. IPv6 is rejected explicitly rather than being
+// mistaken for an (invalid) domain.
 func Classify(entry string) (Kind, string, error) {
 	if looksLikeIP(entry) {
 		ip, err := NormalizeIP(entry)
@@ -423,21 +425,39 @@ func looksLikeIP(s string) bool {
 	return s != "" && strings.Trim(s, "0123456789.") == ""
 }
 
-// NormalizeIP validates s as a single IPv4 address and returns its canonical
-// form.
+// NormalizeIP validates s as a single IPv4 address or an IPv4 CIDR range and
+// returns its canonical form. A /32 range is normalized to the plain address.
 func NormalizeIP(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	switch {
-	case strings.Contains(s, "/"):
-		return "", fmt.Errorf("%q: CIDR ranges are not supported, list individual IPv4 addresses", s)
 	case strings.Contains(s, ":"):
-		return "", fmt.Errorf("%q: IPv6 is not supported, only IPv4 addresses", s)
+		return "", fmt.Errorf("%q: IPv6 is not supported, only IPv4 addresses and ranges", s)
+	case strings.Contains(s, "/"):
+		return normalizePrefix(s)
 	}
 	ip := parseIPv4(s)
 	if ip == "" {
 		return "", fmt.Errorf("%q is not a valid IPv4 address", s)
 	}
 	return ip, nil
+}
+
+// normalizePrefix validates s as an IPv4 CIDR range. Host bits must be zero,
+// so a typo like 10.1.2.3/8 isn't silently widened to 10.0.0.0/8.
+func normalizePrefix(s string) (string, error) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil || !p.Addr().Is4() {
+		return "", fmt.Errorf("%q is not a valid IPv4 CIDR range", s)
+	}
+	switch {
+	case p.Bits() == 0:
+		return "", fmt.Errorf("%q would replace the default route", s)
+	case p != p.Masked():
+		return "", fmt.Errorf("%q has host bits set (did you mean %s?)", s, p.Masked())
+	case p.Bits() == 32:
+		return p.Addr().String(), nil
+	}
+	return p.String(), nil
 }
 
 // NormalizeDomain validates s as a DNS name and returns it lowercased,

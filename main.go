@@ -29,7 +29,7 @@ var netbirdBin string
 func main() {
 	root := &cobra.Command{
 		Use:   "netbird-excluder",
-		Short: "Force specific domains and IPs to route via the LAN gateway instead of through NetBird",
+		Short: "Force specific domains, IPs and IPv4 ranges to route via the LAN gateway instead of through NetBird",
 		// Errors here are about the input (a bad entry, a broken config
 		// file), not about how the command was invoked.
 		SilenceUsage: true,
@@ -135,7 +135,7 @@ func newInstallCmd() *cobra.Command {
 				return fmt.Errorf("install: %w", err)
 			}
 			fmt.Printf("installed and started %s (binary: %s, log: /var/log/%s.log)\n", label, binPath, label)
-			fmt.Printf("manage the exclusion list by editing %s or with: netbird-excluder add|remove|list <domain|ip>\n", config.Path)
+			fmt.Printf("manage the exclusion list by editing %s or with: netbird-excluder add|remove|list <domain|ip|cidr>\n", config.Path)
 			return nil
 		},
 	}
@@ -170,8 +170,8 @@ func newUninstallCmd() *cobra.Command {
 
 func newAddCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "add <domain|ip> [domain|ip...]",
-		Short: "Add domain(s) and/or IPv4 address(es) to the exclusion list",
+		Use:   "add <domain|ip|cidr> [domain|ip|cidr...]",
+		Short: "Add domain(s), IPv4 address(es) and/or CIDR range(s) to the exclusion list",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			requireRoot("to change the exclusion list")
@@ -200,9 +200,9 @@ func newAddCmd() *cobra.Command {
 
 func newRemoveCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "remove <domain|ip> [domain|ip...]",
+		Use:     "remove <domain|ip|cidr> [domain|ip|cidr...]",
 		Aliases: []string{"rm"},
-		Short:   "Remove domain(s) and/or IPv4 address(es) from the exclusion list",
+		Short:   "Remove domain(s), IPv4 address(es) and/or CIDR range(s) from the exclusion list",
 		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			requireRoot("to change the exclusion list")
@@ -276,8 +276,8 @@ func newListCmd() *cobra.Command {
 
 func newCheckCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "check <domain|ip> [domain|ip...]",
-		Short: "Preview a domain's or IP's current route without adding it",
+		Use:   "check <domain|ip|cidr> [domain|ip|cidr...]",
+		Short: "Preview a domain's, IP's or range's current route without adding it",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nbIface, nbErr := netbird.InterfaceName(netbirdBin)
@@ -315,7 +315,7 @@ func newValidateCmd() *cobra.Command {
 			if !cfg.Enabled {
 				state = "disabled"
 			}
-			fmt.Printf("%s: OK (%s, %d domain(s), %d IP(s))\n", path, state, len(cfg.Domains), len(cfg.IPs))
+			fmt.Printf("%s: OK (%s, %d domain(s), %d IP(s)/range(s))\n", path, state, len(cfg.Domains), len(cfg.IPs))
 			return nil
 		},
 	}
@@ -334,20 +334,20 @@ func printDomainRoute(domain, nbIface string, nbOK bool) {
 	}
 }
 
-// printRoute prints one line for ip (labelled with the entry it came from),
-// saying whether it's currently going through NetBird's interface (nbIface,
-// valid only if nbOK) or directly.
+// printRoute prints one line for ip, an address or CIDR range (labelled with
+// the entry it came from), saying whether it's currently going through
+// NetBird's interface (nbIface, valid only if nbOK) or directly.
 func printRoute(label, ip, nbIface string, nbOK bool) {
 	gw, iface, err := routing.RouteInfo(ip)
 	switch {
 	case err != nil:
-		fmt.Printf("  %-30s %-16s route unknown: %v\n", label, ip, err)
+		fmt.Printf("  %-30s %-18s route unknown: %v\n", label, ip, err)
 	case nbOK && iface == nbIface:
-		fmt.Printf("  %-30s %-16s via NetBird (%s)\n", label, ip, iface)
+		fmt.Printf("  %-30s %-18s via NetBird (%s)\n", label, ip, iface)
 	case gw == "":
-		fmt.Printf("  %-30s %-16s direct via %s\n", label, ip, iface)
+		fmt.Printf("  %-30s %-18s direct via %s\n", label, ip, iface)
 	default:
-		fmt.Printf("  %-30s %-16s direct via %s (%s)\n", label, ip, iface, gw)
+		fmt.Printf("  %-30s %-18s direct via %s (%s)\n", label, ip, iface, gw)
 	}
 }
 

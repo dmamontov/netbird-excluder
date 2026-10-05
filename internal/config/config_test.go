@@ -18,7 +18,8 @@ exclude:
     - sub.example.org
   ips:
     - 104.16.12.34
-    - 104.16.12.34
+    - 104.16.12.34/32
+    - 160.79.104.0/23
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +30,7 @@ exclude:
 	if want := []string{"example.com", "sub.example.org"}; !slices.Equal(c.Domains, want) {
 		t.Errorf("Domains = %v, want %v", c.Domains, want)
 	}
-	if want := []string{"104.16.12.34"}; !slices.Equal(c.IPs, want) {
+	if want := []string{"104.16.12.34", "160.79.104.0/23"}; !slices.Equal(c.IPs, want) {
 		t.Errorf("IPs = %v, want %v", c.IPs, want)
 	}
 }
@@ -53,7 +54,10 @@ func TestParseErrors(t *testing.T) {
 		{"unknown key", "exclude:\n  domain:\n    - a.com\n", "field domain not found"},
 		{"wrong type", "enabled: maybe\n", "cannot unmarshal"},
 		{"ipv6", "exclude:\n  ips:\n    - 2001:db8::1\n", "line 3: exclude.ips: \"2001:db8::1\": IPv6 is not supported"},
-		{"cidr", "exclude:\n  ips:\n    - 10.0.0.0/8\n", "CIDR ranges are not supported"},
+		{"cidr host bits", "exclude:\n  ips:\n    - 10.1.2.3/8\n", "has host bits set (did you mean 10.0.0.0/8?)"},
+		{"cidr zero bits", "exclude:\n  ips:\n    - 0.0.0.0/0\n", "would replace the default route"},
+		{"cidr bad bits", "exclude:\n  ips:\n    - 10.0.0.0/33\n", "not a valid IPv4 CIDR range"},
+		{"cidr as domain", "exclude:\n  domains:\n    - 10.0.0.0/8\n", "put it under exclude.ips"},
 		{"bad ip", "exclude:\n  ips:\n    - 1.2.3.256\n", "not a valid IPv4 address"},
 		{"ip as domain", "exclude:\n  domains:\n    - 1.2.3.4\n", "put it under exclude.ips"},
 		{"bad domain", "exclude:\n  domains:\n    - -bad-.com\n", "not a valid domain name"},
@@ -94,7 +98,11 @@ func TestClassify(t *testing.T) {
 		{" 1.2.3.4 ", KindIP, "1.2.3.4", false},
 		{"1.2.3", KindIP, "", true},
 		{"::1", KindIP, "", true},
-		{"10.0.0.0/8", KindIP, "", true},
+		{"10.0.0.0/8", KindIP, "10.0.0.0/8", false},
+		{" 160.79.104.0/23 ", KindIP, "160.79.104.0/23", false},
+		{"1.2.3.4/32", KindIP, "1.2.3.4", false},
+		{"10.0.0.1/8", KindIP, "", true},
+		{"::/0", KindIP, "", true},
 		{"no spaces.com", KindDomain, "", true},
 	}
 	for _, tt := range tests {

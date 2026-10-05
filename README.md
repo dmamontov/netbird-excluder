@@ -1,6 +1,6 @@
 # netbird-excluder
 
-**macOS only.** Forces specific domains and IPv4 addresses to route through
+**macOS only.** Forces specific domains, IPv4 addresses and IPv4 ranges to route through
 the LAN gateway instead of through [NetBird](https://netbird.io). It shells out to `/sbin/route`
 and `launchctl`, both macOS-specific - it will not build or run correctly on
 Linux or Windows.
@@ -17,20 +17,21 @@ often you can't tell why, since your NetBird routes look correct.
 
 You can't fix this in NetBird's own config (no access, or it would break the
 resource it was set up for). `netbird-excluder` fixes it locally: it keeps an
-exclusion list of domains and IPv4 addresses, and for every listed IP (and
-every IP the listed domains currently resolve to) it holds an explicit host
-route via your LAN gateway that overrides whatever
+exclusion list of domains, IPv4 addresses and CIDR ranges, and for every
+listed IP or range (and every IP the listed domains currently resolve to) it
+holds an explicit route via your LAN gateway that overrides whatever
 NetBird has pushed - re-asserting it every few seconds so NetBird's own
 reconciliation (or a Wi-Fi network change) can't quietly undo it.
 
 ## How it works
 
 - On each pass it resolves every listed domain and, for each resulting IP
-  and each listed IP, checks the route the kernel currently uses
-  (`route -n get -host <ip>`).
+  and each listed IP or range, checks the route the kernel currently uses
+  (`route -n get -host <ip>`, or `-net <cidr>` for a range).
 - If that route isn't already via the LAN gateway, it deletes it and adds a
-  static host route via the LAN gateway/interface, overriding NetBird.
-- The very first route seen for an IP is remembered as the "original" route.
+  static host route (network route for a range) via the LAN
+  gateway/interface, overriding NetBird.
+- The very first route seen for an IP or range is remembered as the "original" route.
   When no listed entry needs that IP any more (a domain stops resolving to
   it, or it's removed from the list), or the tool stops/panics/is disabled,
   the original route is restored - not just deleted.
@@ -97,14 +98,22 @@ exclude:
   domains:
     - example.com
     - another-site.com
-  # Literal IPv4 addresses to route via the LAN gateway instead of NetBird.
+  # IPv4 addresses or CIDR ranges (e.g. 10.0.0.0/8) to route via the LAN
+  # gateway instead of NetBird.
   ips:
     - 104.16.12.34
+    - 160.79.104.0/23
 ```
 
-- Only single IPv4 addresses are supported under `ips` - IPv6 and CIDR
-  ranges are rejected. (A CIDR route via the LAN wouldn't override
-  NetBird's more specific `/32` routes inside it anyway.)
+- `ips` takes single IPv4 addresses and IPv4 CIDR ranges; IPv6 is rejected.
+  A range must have its host bits zeroed (`10.1.2.3/8` is an error that
+  suggests `10.0.0.0/8`), `/0` is rejected, and `/32` is stored as the
+  plain address.
+- A range is overridden with a single network route, which beats NetBird
+  routes that are the same size or wider - but not NetBird's more specific
+  routes inside it, such as the `/32` host routes its domain-based routes
+  install. If an address inside the range still goes through NetBird, list
+  that domain or address too.
 - Domains are lowercased and a trailing dot is dropped; duplicates are
   ignored. An IP under `domains` is an error, so the two lists can't be
   mixed up silently.
@@ -116,14 +125,14 @@ exclude:
 
 ```bash
 ./netbird-excluder validate                 # or: validate path/to/other.yaml
-#   /etc/netbird-excluder/config.yaml: OK (enabled, 2 domain(s), 1 IP(s))
+#   /etc/netbird-excluder/config.yaml: OK (enabled, 2 domain(s), 2 IP(s)/range(s))
 ```
 
 Or manage it from the CLI - entries are detected as domain or IP
 automatically, and your comments and ordering in the file are preserved:
 
 ```bash
-sudo ./netbird-excluder add example.com 104.16.12.34
+sudo ./netbird-excluder add example.com 104.16.12.34 160.79.104.0/23
 sudo ./netbird-excluder remove example.com     # alias: rm
 ./netbird-excluder list                        # alias: ls, no root needed
 ```
