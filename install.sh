@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Downloads the latest netbird-excluder release for this Mac, installs it to
 # /usr/local/bin, and sets it up as a persistent LaunchDaemon. Re-run any
-# time to update to the latest version - the domain list and running service
-# are left as they are.
+# time to update to the latest version - the exclusion list and running
+# service are left as they are.
 set -euo pipefail
 
 REPO="dmamontov/netbird-excluder"
@@ -39,5 +39,6 @@ echo
 "${INSTALL_DIR}/${BIN_NAME}" list
 echo
 echo "installed and running. next steps:"
-echo "  sudo ${BIN_NAME} add <domain>       # add a domain to force via LAN"
-echo "  ${BIN_NAME} list                    # see current domains and their routes"
+echo "  sudo ${BIN_NAME} add <domain|ip>    # add a domain or IPv4 address to force via LAN"
+echo "  ${BIN_NAME} list                    # see current entries and their routes"
+echo "  or edit /etc/netbird-excluder/config.yaml and check it with: ${BIN_NAME} validate"
