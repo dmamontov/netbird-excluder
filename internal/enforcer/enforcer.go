@@ -9,20 +9,23 @@ import (
 	"netbird-excluder/internal/routing"
 )
 
-// ownedRoute tracks, for one IP, which domains currently need it forced via
-// the LAN gateway and what its route looked like before we touched it, so it
-// can be put back exactly as NetBird had it.
+// ownedRoute tracks, for one destination (an IP or a CIDR range), which
+// sources (a listed domain resolving to it, or the IP/range itself being
+// listed) currently need it forced via the LAN
+// gateway and what its route looked like before we touched it, so it can be
+// put back exactly as NetBird had it.
 type ownedRoute struct {
-	domains     map[string]bool
+	sources     map[string]bool
 	origGateway string
 	origIface   string
 	overridden  bool
 }
 
-// Enforcer routes domains via the LAN gateway instead of whatever route
-// NetBird has pushed for their IPs. The domain list and enabled/disabled
-// state are re-read from config on every Reconcile, so "add"/"remove"/"up"/
-// "down" run from another invocation take effect without a restart.
+// Enforcer routes listed domains, IPs and CIDR ranges via the LAN gateway instead of
+// whatever route NetBird has pushed for them. The exclusion list and
+// enabled/disabled state are re-read from config on every Reconcile, so
+// edits to the file or "add"/"remove"/"up"/"down" run from another
+// invocation take effect without a restart.
 // PinnedIface/PinnedGateway override auto-detection; leave empty to
 // re-detect the LAN gateway from the default route on every Reconcile
 // (handles switching Wi-Fi networks).
@@ -39,6 +42,7 @@ type Enforcer struct {
 	netbirdUp      bool
 	enabledChecked bool
 	enabled        bool
+	configErr      string
 }
 
 func New(pinnedIface, pinnedGateway, netbirdBin string) *Enforcer {
@@ -83,10 +87,28 @@ func (e *Enforcer) checkEnabled(cfgEnabled bool) bool {
 	return cfgEnabled
 }
 
-func (e *Enforcer) Reconcile() {
+// loadConfig reads the config, logging a broken file once (not every tick)
+// and again once it's fixed. On error the caller keeps the current routes
+// rather than tearing them down over a typo mid-edit.
+func (e *Enforcer) loadConfig() *config.Config {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Printf("load config: %v (skipping this pass)", err)
+		if msg := err.Error(); msg != e.configErr {
+			log.Printf("load config: %v (keeping current routes until it's fixed)", err)
+			e.configErr = msg
+		}
+		return nil
+	}
+	if e.configErr != "" {
+		log.Printf("config is valid again; resuming")
+		e.configErr = ""
+	}
+	return cfg
+}
+
+func (e *Enforcer) Reconcile() {
+	cfg := e.loadConfig()
+	if cfg == nil {
 		return
 	}
 
@@ -105,7 +127,7 @@ func (e *Enforcer) Reconcile() {
 		return
 	}
 
-	seenByDomain := make(map[string]map[string]bool, len(cfg.Domains))
+	seenBySource := make(map[string]map[string]bool, len(cfg.Domains)+len(cfg.IPs))
 
 	for _, domain := range cfg.Domains {
 		ips, err := resolver.Lookup(domain)
@@ -114,16 +136,25 @@ func (e *Enforcer) Reconcile() {
 			continue
 		}
 
+		src := "domain " + domain
 		seen := make(map[string]bool, len(ips))
-		seenByDomain[domain] = seen
+		seenBySource[src] = seen
 
 		for _, ip := range ips {
 			seen[ip] = true
-			e.ensureOwned(domain, ip)
+			e.ensureOwned(src, ip)
 		}
 	}
 
-	e.releaseStale(seenByDomain)
+	// A range gets a single network route; NetBird routes more specific than
+	// it (e.g. its /32 host routes) still win for the addresses they cover.
+	for _, dest := range cfg.IPs {
+		src := "listed " + dest
+		seenBySource[src] = map[string]bool{dest: true}
+		e.ensureOwned(src, dest)
+	}
+
+	e.releaseStale(seenBySource)
 }
 
 func (e *Enforcer) refreshLAN() error {
@@ -150,87 +181,88 @@ func (e *Enforcer) refreshLAN() error {
 	return nil
 }
 
-// ensureOwned records domain as an owner of ip and makes sure ip currently
-// routes via the LAN gateway, re-overriding it if NetBird (or a network
-// change) has since pointed it elsewhere. The route observed the first time
-// an IP is seen is kept as the "original" to restore later.
-func (e *Enforcer) ensureOwned(domain, ip string) {
-	curGw, curIface, err := routing.RouteInfo(ip)
+// ensureOwned records src as an owner of dest (an IP or CIDR range) and
+// makes sure dest currently routes via the LAN gateway, re-overriding it if
+// NetBird (or a network change) has since pointed it elsewhere. The route
+// observed the first time dest is seen is kept as the "original" to restore
+// later.
+func (e *Enforcer) ensureOwned(src, dest string) {
+	curGw, curIface, err := routing.RouteInfo(dest)
 	if err != nil {
-		log.Printf("check route for %s (%s): %v", ip, domain, err)
+		log.Printf("check route for %s (%s): %v", dest, src, err)
 	}
 
-	entry, exists := e.owners[ip]
+	entry, exists := e.owners[dest]
 	if !exists {
-		entry = &ownedRoute{domains: make(map[string]bool), origGateway: curGw, origIface: curIface}
-		e.owners[ip] = entry
+		entry = &ownedRoute{sources: make(map[string]bool), origGateway: curGw, origIface: curIface}
+		e.owners[dest] = entry
 	}
-	entry.domains[domain] = true
+	entry.sources[src] = true
 
 	if curIface == e.LANIface && curGw == e.LANGateway {
 		return
 	}
 
-	if err := routing.DeleteHostRoute(ip); err != nil {
-		log.Printf("delete existing route for %s (%s): %v", ip, domain, err)
+	if err := routing.DeleteRoute(dest); err != nil {
+		log.Printf("delete existing route for %s (%s): %v", dest, src, err)
 	}
-	if err := routing.AddHostRoute(ip, e.LANGateway); err != nil {
-		log.Printf("force %s (%s) via LAN: %v", ip, domain, err)
+	if err := routing.AddRoute(dest, e.LANGateway); err != nil {
+		log.Printf("force %s (%s) via LAN: %v", dest, src, err)
 		return
 	}
 	entry.overridden = true
-	log.Printf("forced %s (%s) via LAN gateway %s", ip, domain, e.LANGateway)
+	log.Printf("forced %s (%s) via LAN gateway %s", dest, src, e.LANGateway)
 }
 
-func (e *Enforcer) releaseStale(seenByDomain map[string]map[string]bool) {
-	for ip, entry := range e.owners {
-		for domain := range entry.domains {
-			if !seenByDomain[domain][ip] {
-				delete(entry.domains, domain)
+func (e *Enforcer) releaseStale(seenBySource map[string]map[string]bool) {
+	for dest, entry := range e.owners {
+		for src := range entry.sources {
+			if !seenBySource[src][dest] {
+				delete(entry.sources, src)
 			}
 		}
-		if len(entry.domains) == 0 {
-			e.restore(ip, entry)
-			delete(e.owners, ip)
+		if len(entry.sources) == 0 {
+			e.restore(dest, entry)
+			delete(e.owners, dest)
 		}
 	}
 }
 
-// restore puts ip's route back the way it was before this Enforcer touched
-// it. If it was never actually overridden (already matched the LAN gateway),
-// nothing is changed.
-func (e *Enforcer) restore(ip string, entry *ownedRoute) {
+// restore puts dest's route back the way it was before this Enforcer
+// touched it. If it was never actually overridden (already matched the LAN
+// gateway), nothing is changed.
+func (e *Enforcer) restore(dest string, entry *ownedRoute) {
 	if !entry.overridden {
 		return
 	}
 
-	if err := routing.DeleteHostRoute(ip); err != nil {
-		log.Printf("remove override for %s: %v", ip, err)
+	if err := routing.DeleteRoute(dest); err != nil {
+		log.Printf("remove override for %s: %v", dest, err)
 	}
 
 	if entry.origIface == "" {
-		log.Printf("released %s (no prior route known, left on default route)", ip)
+		log.Printf("released %s (no prior route known, left on default route)", dest)
 		return
 	}
 
 	var err error
 	if entry.origGateway != "" {
-		err = routing.AddHostRoute(ip, entry.origGateway)
+		err = routing.AddRoute(dest, entry.origGateway)
 	} else {
-		err = routing.AddInterfaceRoute(ip, entry.origIface)
+		err = routing.AddInterfaceRoute(dest, entry.origIface)
 	}
 	if err != nil {
-		log.Printf("restore original route for %s via %s: %v", ip, entry.origIface, err)
+		log.Printf("restore original route for %s via %s: %v", dest, entry.origIface, err)
 		return
 	}
-	log.Printf("restored %s via %s (as it was before)", ip, entry.origIface)
+	log.Printf("restored %s via %s (as it was before)", dest, entry.origIface)
 }
 
 // Close restores every route this Enforcer has overridden. Safe to call
 // multiple times and from a recovered panic.
 func (e *Enforcer) Close() {
-	for ip, entry := range e.owners {
-		e.restore(ip, entry)
+	for dest, entry := range e.owners {
+		e.restore(dest, entry)
 	}
 	e.owners = make(map[string]*ownedRoute)
 }

@@ -21,3 +21,6 @@ jobs:
         env:
           GOOS: darwin
           GOARCH: arm64
+      # Tests only cover platform-independent logic (config parsing), so they
+      # run natively on the Linux runner.
+      - run: go test ./...

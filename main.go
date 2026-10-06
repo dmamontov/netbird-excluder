@@ -29,7 +29,10 @@ var netbirdBin string
 func main() {
 	root := &cobra.Command{
 		Use:   "netbird-excluder",
-		Short: "Force specific domains to route via the LAN gateway instead of through NetBird",
+		Short: "Force specific domains, IPs and IPv4 ranges to route via the LAN gateway instead of through NetBird",
+		// Errors here are about the input (a bad entry, a broken config
+		// file), not about how the command was invoked.
+		SilenceUsage: true,
 	}
 	root.PersistentFlags().StringVar(&netbirdBin, "netbird-bin", "", "path to the netbird CLI (default: auto-detect)")
 
@@ -41,6 +44,7 @@ func main() {
 		newRemoveCmd(),
 		newListCmd(),
 		newCheckCmd(),
+		newValidateCmd(),
 		newUpCmd(),
 		newDownCmd(),
 	)
@@ -62,7 +66,7 @@ func newRunCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "run",
-		Short: "Run in the foreground, enforcing the configured domain list",
+		Short: "Run in the foreground, enforcing the configured exclusion list",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			requireRoot("(routes modify the kernel routing table)")
 
@@ -100,7 +104,7 @@ func newRunCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().DurationVar(&interval, "interval", 30*time.Second, "how often to re-read the domain list and re-check routes")
+	cmd.Flags().DurationVar(&interval, "interval", 30*time.Second, "how often to re-read the exclusion list and re-check routes")
 	cmd.Flags().StringVar(&iface, "iface", "", "LAN interface to use (default: auto-detect from the default route)")
 	cmd.Flags().StringVar(&gateway, "gateway", "", "LAN gateway IP to use (default: auto-detect from the default route)")
 	return cmd
@@ -131,12 +135,12 @@ func newInstallCmd() *cobra.Command {
 				return fmt.Errorf("install: %w", err)
 			}
 			fmt.Printf("installed and started %s (binary: %s, log: /var/log/%s.log)\n", label, binPath, label)
-			fmt.Println("manage the domain list with: netbird-excluder add|remove|list <domain>")
+			fmt.Printf("manage the exclusion list by editing %s or with: netbird-excluder add|remove|list <domain|ip|cidr>\n", config.Path)
 			return nil
 		},
 	}
 
-	cmd.Flags().DurationVar(&interval, "interval", 30*time.Second, "how often to re-read the domain list and re-check routes")
+	cmd.Flags().DurationVar(&interval, "interval", 30*time.Second, "how often to re-read the exclusion list and re-check routes")
 	cmd.Flags().StringVar(&iface, "iface", "", "LAN interface to use (default: auto-detect from the default route)")
 	cmd.Flags().StringVar(&gateway, "gateway", "", "LAN gateway IP to use (default: auto-detect from the default route)")
 	cmd.Flags().StringVar(&label, "label", defaultLabel, "LaunchDaemon label")
@@ -166,17 +170,20 @@ func newUninstallCmd() *cobra.Command {
 
 func newAddCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "add <domain> [domain...]",
-		Short: "Add domain(s) to the blacklist",
+		Use:   "add <domain|ip|cidr> [domain|ip|cidr...]",
+		Short: "Add domain(s), IPv4 address(es) and/or CIDR range(s) to the exclusion list",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			requireRoot("to change the domain list")
+			requireRoot("to change the exclusion list")
 
 			cfg, err := config.Load()
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			added := cfg.Add(args)
+			added, err := cfg.Add(args)
+			if err != nil {
+				return err
+			}
 			if err := config.Save(cfg); err != nil {
 				return fmt.Errorf("save config: %w", err)
 			}
@@ -193,18 +200,21 @@ func newAddCmd() *cobra.Command {
 
 func newRemoveCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "remove <domain> [domain...]",
+		Use:     "remove <domain|ip|cidr> [domain|ip|cidr...]",
 		Aliases: []string{"rm"},
-		Short:   "Remove domain(s) from the blacklist",
+		Short:   "Remove domain(s), IPv4 address(es) and/or CIDR range(s) from the exclusion list",
 		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			requireRoot("to change the domain list")
+			requireRoot("to change the exclusion list")
 
 			cfg, err := config.Load()
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			removed := cfg.Remove(args)
+			removed, err := cfg.Remove(args)
+			if err != nil {
+				return err
+			}
 			if err := config.Save(cfg); err != nil {
 				return fmt.Errorf("save config: %w", err)
 			}
@@ -223,7 +233,7 @@ func newListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls"},
-		Short:   "Show the domain list, enabled state, and each domain's current route",
+		Short:   "Show the exclusion list, enabled state, and each entry's current route",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
@@ -241,14 +251,23 @@ func newListCmd() *cobra.Command {
 			}
 			fmt.Printf("state: %s, netbird: %s\n", state, nbState)
 
-			if len(cfg.Domains) == 0 {
-				fmt.Println("no domains configured")
+			if len(cfg.Domains) == 0 && len(cfg.IPs) == 0 {
+				fmt.Printf("nothing excluded (add entries to %s or with: netbird-excluder add)\n", config.Path)
 				return nil
 			}
 
 			nbIface, nbErr := netbird.InterfaceName(netbirdBin)
-			for _, domain := range cfg.Domains {
-				printDomainRoute(domain, nbIface, nbErr == nil)
+			if len(cfg.Domains) > 0 {
+				fmt.Println("domains:")
+				for _, domain := range cfg.Domains {
+					printDomainRoute(domain, nbIface, nbErr == nil)
+				}
+			}
+			if len(cfg.IPs) > 0 {
+				fmt.Println("ips:")
+				for _, ip := range cfg.IPs {
+					printRoute(ip, ip, nbIface, nbErr == nil)
+				}
 			}
 			return nil
 		},
@@ -257,22 +276,53 @@ func newListCmd() *cobra.Command {
 
 func newCheckCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "check <domain> [domain...]",
-		Short: "Preview a domain's current route without adding it",
+		Use:   "check <domain|ip|cidr> [domain|ip|cidr...]",
+		Short: "Preview a domain's, IP's or range's current route without adding it",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nbIface, nbErr := netbird.InterfaceName(netbirdBin)
-			for _, domain := range args {
-				printDomainRoute(domain, nbIface, nbErr == nil)
+			for _, entry := range args {
+				kind, norm, err := config.Classify(entry)
+				switch {
+				case err != nil:
+					fmt.Printf("  %s: %v\n", entry, err)
+				case kind == config.KindIP:
+					printRoute(norm, norm, nbIface, nbErr == nil)
+				default:
+					printDomainRoute(norm, nbIface, nbErr == nil)
+				}
 			}
 			return nil
 		},
 	}
 }
 
-// printDomainRoute prints one line per resolved IP for domain, saying
-// whether it's currently going through NetBird's interface (nbIface, valid
-// only if nbOK) or directly.
+func newValidateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "validate [file]",
+		Short: "Check a config file for errors without applying it (default: " + config.Path + ")",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := config.Path
+			if len(args) == 1 {
+				path = args[0]
+			}
+			cfg, err := config.LoadFile(path)
+			if err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			state := "enabled"
+			if !cfg.Enabled {
+				state = "disabled"
+			}
+			fmt.Printf("%s: OK (%s, %d domain(s), %d IP(s)/range(s))\n", path, state, len(cfg.Domains), len(cfg.IPs))
+			return nil
+		},
+	}
+}
+
+// printDomainRoute prints one line per resolved IP for domain (see
+// printRoute).
 func printDomainRoute(domain, nbIface string, nbOK bool) {
 	ips, err := resolver.Lookup(domain)
 	if err != nil {
@@ -280,17 +330,24 @@ func printDomainRoute(domain, nbIface string, nbOK bool) {
 		return
 	}
 	for _, ip := range ips {
-		gw, iface, err := routing.RouteInfo(ip)
-		switch {
-		case err != nil:
-			fmt.Printf("  %-30s %-16s route unknown: %v\n", domain, ip, err)
-		case nbOK && iface == nbIface:
-			fmt.Printf("  %-30s %-16s via NetBird (%s)\n", domain, ip, iface)
-		case gw == "":
-			fmt.Printf("  %-30s %-16s direct via %s\n", domain, ip, iface)
-		default:
-			fmt.Printf("  %-30s %-16s direct via %s (%s)\n", domain, ip, iface, gw)
-		}
+		printRoute(domain, ip, nbIface, nbOK)
+	}
+}
+
+// printRoute prints one line for ip, an address or CIDR range (labelled with
+// the entry it came from), saying whether it's currently going through
+// NetBird's interface (nbIface, valid only if nbOK) or directly.
+func printRoute(label, ip, nbIface string, nbOK bool) {
+	gw, iface, err := routing.RouteInfo(ip)
+	switch {
+	case err != nil:
+		fmt.Printf("  %-30s %-18s route unknown: %v\n", label, ip, err)
+	case nbOK && iface == nbIface:
+		fmt.Printf("  %-30s %-18s via NetBird (%s)\n", label, ip, iface)
+	case gw == "":
+		fmt.Printf("  %-30s %-18s direct via %s\n", label, ip, iface)
+	default:
+		fmt.Printf("  %-30s %-18s direct via %s (%s)\n", label, ip, iface, gw)
 	}
 }
 
